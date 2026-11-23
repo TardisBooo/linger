@@ -128,11 +128,13 @@ func (p *codexProcess) cleanupTurn() error {
 	if !snapshot.completed {
 		// The turn can finish between the snapshot and Codex handling the interrupt.
 		_, _, interruptErr := p.transport.call(ctx, "turn/interrupt", map[string]any{"threadId": thread, "turnId": turn}, 0, nil)
-		if _, err := p.waitTracker(ctx, func(t codexTurnTracker) bool { return t.completed }); err != nil {
-			if interruptErr != nil {
-				return fmt.Errorf("interrupt Codex turn: %w", interruptErr)
+		if !p.trackerSnapshot().completed && !p.threadIdleAfterInterrupt(ctx, thread, interruptErr) {
+			if _, err := p.waitTracker(ctx, func(t codexTurnTracker) bool { return t.completed }); err != nil {
+				if interruptErr != nil {
+					return fmt.Errorf("interrupt Codex turn: %w", interruptErr)
+				}
+				return fmt.Errorf("interrupted turn did not settle: %w", err)
 			}
-			return fmt.Errorf("interrupted turn did not settle: %w", err)
 		}
 	}
 	commands := p.turnCommands(turn)
@@ -158,6 +160,27 @@ func (p *codexProcess) cleanupTurn() error {
 		case <-time.After(codexCleanupPoll):
 		}
 	}
+}
+
+func (p *codexProcess) threadIdleAfterInterrupt(ctx context.Context, threadID string, interruptErr error) bool {
+	var rpcErr *codexRPCError
+	if !errors.As(interruptErr, &rpcErr) || rpcErr.Code != -32600 {
+		return false
+	}
+	result, _, err := p.transport.call(ctx, "thread/read", map[string]any{"threadId": threadID}, 0, nil)
+	if err != nil {
+		return false
+	}
+	var response struct {
+		Thread struct {
+			ID     string `json:"id"`
+			Status struct {
+				Type string `json:"type"`
+			} `json:"status"`
+		} `json:"thread"`
+	}
+	return json.Unmarshal(result, &response) == nil &&
+		response.Thread.ID == threadID && response.Thread.Status.Type == "idle"
 }
 
 // waitTracker polls until ready holds, the transport dies, or ctx ends.

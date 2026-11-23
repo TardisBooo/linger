@@ -74,6 +74,9 @@
 
 - Default tests use deterministic providers and real fixture child processes;
   they never call a live model.
+- If Codex rejects an interrupt as an invalid request while completion is
+  unconfirmed, the Daemon checks whether the same thread is idle. Terminal
+  cleanup and process exit checks still apply.
 - Process-test watchdogs are harness budgets for loaded developer machines, not
   product startup or shutdown SLAs. Do not add retries or weaken lifecycle,
   process-identity, or cleanup assertions to handle timing variance.
