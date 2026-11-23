@@ -410,6 +410,58 @@ func TestCodexLateTurnStartAckFeedsCleanup(t *testing.T) {
 }
 
 func TestCodexCleanupTerminatesOnlyCurrentTurnTerminals(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rejection  *codexRPCError
+		threadRead string
+		wantError  bool
+	}{
+		{name: "completion notification"},
+		{
+			name:       "already idle",
+			rejection:  &codexRPCError{Code: -32600, Message: "interrupt rejected"},
+			threadRead: `{"thread":{"id":"thread-1","status":{"type":"idle"}}}`,
+		},
+		{
+			name:       "different active turn",
+			rejection:  &codexRPCError{Code: -32600, Message: "expected active turn id turn-2 but found turn-3"},
+			threadRead: `{"thread":{"id":"thread-1","status":{"type":"active","activeFlags":[]}}}`,
+			wantError:  true,
+		},
+		{
+			name:       "different thread",
+			rejection:  &codexRPCError{Code: -32600, Message: "no active turn to interrupt"},
+			threadRead: `{"thread":{"id":"thread-9","status":{"type":"idle"}}}`,
+			wantError:  true,
+		},
+		{
+			name:       "missing status",
+			rejection:  &codexRPCError{Code: -32600, Message: "no active turn to interrupt"},
+			threadRead: `{"thread":{"id":"thread-1"}}`,
+			wantError:  true,
+		},
+		{
+			name:       "malformed status",
+			rejection:  &codexRPCError{Code: -32600, Message: "no active turn to interrupt"},
+			threadRead: `{"thread":{"id":"thread-1","status":{"type":true}}}`,
+			wantError:  true,
+		},
+		{
+			name:      "server error",
+			rejection: &codexRPCError{Code: -32603, Message: "no active turn to interrupt"},
+			wantError: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testCodexCleanupCurrentTurnTerminals(t, tc.rejection, tc.threadRead, tc.wantError)
+		})
+	}
+}
+
+func testCodexCleanupCurrentTurnTerminals(t *testing.T, rejection *codexRPCError, threadRead string, wantError bool) {
+	t.Helper()
+	previous := codexCleanupBudget.set(time.Second)
+	t.Cleanup(func() { codexCleanupBudget.set(previous) })
 	transport, requests, replies := codexPipeTransport(t)
 	proc := &codexProcess{transport: transport}
 	proc.trackTurnStart("thread-1")
@@ -417,7 +469,10 @@ func TestCodexCleanupTerminatesOnlyCurrentTurnTerminals(t *testing.T) {
 	proc.trackNotification("item/started", "thread-1", "turn-2", codexItem{ID: "cmd-a", Type: "commandExecution"})
 	proc.trackNotification("item/started", "thread-1", "turn-1", codexItem{ID: "cmd-old", Type: "commandExecution"})
 	cleanup := make(chan error, 1)
-	go func() { cleanup <- proc.cleanupTurn() }()
+	go func() {
+		cleanup <- proc.cleanupTurn()
+		_ = requests.Close()
+	}()
 	decoder := json.NewDecoder(requests)
 	var terminated []string
 	lists := 0
@@ -428,18 +483,38 @@ func TestCodexCleanupTerminatesOnlyCurrentTurnTerminals(t *testing.T) {
 			Params map[string]any `json:"params"`
 		}
 		if err := decoder.Decode(&request); err != nil {
-			t.Fatal(err)
+			cleanupErr := <-cleanup
+			var rpcErr *codexRPCError
+			if !wantError || !errors.As(cleanupErr, &rpcErr) || *rpcErr != *rejection {
+				t.Fatalf("cleanup stopped before checking terminals: %v", cleanupErr)
+			}
+			return
 		}
 		reply := func(result string) {
 			_, _ = io.WriteString(replies, `{"id":`+jsonNumber(request.ID)+`,"result":`+result+`}`+"\n")
 		}
 		switch request.Method {
 		case "turn/interrupt":
-			reply(`{}`)
+			if request.Params["threadId"] != "thread-1" || request.Params["turnId"] != "turn-2" {
+				t.Fatalf("unexpected interrupt: %v", request.Params)
+			}
 			// An item that started while the interrupt raced still counts.
 			proc.trackNotification("item/started", "thread-1", "turn-2", codexItem{ID: "cmd-b", Type: "commandExecution"})
+			if rejection != nil {
+				_, _ = fmt.Fprintf(replies, `{"id":%d,"error":{"code":%d,"message":%q}}`+"\n", request.ID, rejection.Code, rejection.Message)
+				continue
+			}
+			reply(`{}`)
 			proc.trackNotification("turn/completed", "thread-1", "turn-2", codexItem{})
+		case "thread/read":
+			if threadRead == "" || request.Params["threadId"] != "thread-1" {
+				t.Fatalf("unexpected thread read: %v", request.Params)
+			}
+			reply(threadRead)
 		case "thread/backgroundTerminals/list":
+			if wantError {
+				t.Fatal("cleanup inspected terminals while the interrupt outcome was unconfirmed")
+			}
 			lists++
 			switch {
 			case len(terminated) >= 2:
