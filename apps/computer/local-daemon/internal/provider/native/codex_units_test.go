@@ -414,9 +414,20 @@ func TestCodexCleanupTerminatesOnlyCurrentTurnTerminals(t *testing.T) {
 		name       string
 		rejection  *codexRPCError
 		threadRead string
+		completeOn string
 		wantError  bool
 	}{
 		{name: "completion notification"},
+		{
+			name:       "completion before rejection",
+			rejection:  &codexRPCError{Code: -32600, Message: "interrupt rejected"},
+			completeOn: "turn/interrupt",
+		},
+		{
+			name:       "completion while thread read is held",
+			rejection:  &codexRPCError{Code: -32600, Message: "interrupt rejected"},
+			completeOn: "thread/read",
+		},
 		{
 			name:       "already idle",
 			rejection:  &codexRPCError{Code: -32600, Message: "interrupt rejected"},
@@ -453,12 +464,12 @@ func TestCodexCleanupTerminatesOnlyCurrentTurnTerminals(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testCodexCleanupCurrentTurnTerminals(t, tc.rejection, tc.threadRead, tc.wantError)
+			testCodexCleanupCurrentTurnTerminals(t, tc.rejection, tc.threadRead, tc.completeOn, tc.wantError)
 		})
 	}
 }
 
-func testCodexCleanupCurrentTurnTerminals(t *testing.T, rejection *codexRPCError, threadRead string, wantError bool) {
+func testCodexCleanupCurrentTurnTerminals(t *testing.T, rejection *codexRPCError, threadRead, completeOn string, wantError bool) {
 	t.Helper()
 	previous := codexCleanupBudget.set(time.Second)
 	t.Cleanup(func() { codexCleanupBudget.set(previous) })
@@ -500,6 +511,9 @@ func testCodexCleanupCurrentTurnTerminals(t *testing.T, rejection *codexRPCError
 			}
 			// An item that started while the interrupt raced still counts.
 			proc.trackNotification("item/started", "thread-1", "turn-2", codexItem{ID: "cmd-b", Type: "commandExecution"})
+			if completeOn == request.Method {
+				proc.trackNotification("turn/completed", "thread-1", "turn-2", codexItem{})
+			}
 			if rejection != nil {
 				_, _ = fmt.Fprintf(replies, `{"id":%d,"error":{"code":%d,"message":%q}}`+"\n", request.ID, rejection.Code, rejection.Message)
 				continue
@@ -507,13 +521,20 @@ func testCodexCleanupCurrentTurnTerminals(t *testing.T, rejection *codexRPCError
 			reply(`{}`)
 			proc.trackNotification("turn/completed", "thread-1", "turn-2", codexItem{})
 		case "thread/read":
-			if threadRead == "" || request.Params["threadId"] != "thread-1" {
+			if request.Params["threadId"] != "thread-1" || (threadRead == "" && completeOn != request.Method) {
 				t.Fatalf("unexpected thread read: %v", request.Params)
+			}
+			if completeOn == request.Method {
+				proc.trackNotification("turn/completed", "thread-1", "turn-2", codexItem{})
+				continue
 			}
 			reply(threadRead)
 		case "thread/backgroundTerminals/list":
 			if wantError {
 				t.Fatal("cleanup inspected terminals while the interrupt outcome was unconfirmed")
+			}
+			if pending := transport.inflight(); pending != 1 {
+				t.Fatalf("pending requests during terminal cleanup = %d, want 1", pending)
 			}
 			lists++
 			switch {

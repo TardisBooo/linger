@@ -128,13 +128,11 @@ func (p *codexProcess) cleanupTurn() error {
 	if !snapshot.completed {
 		// The turn can finish between the snapshot and Codex handling the interrupt.
 		_, _, interruptErr := p.transport.call(ctx, "turn/interrupt", map[string]any{"threadId": thread, "turnId": turn}, 0, nil)
-		if !p.trackerSnapshot().completed && !p.threadIdleAfterInterrupt(ctx, thread, interruptErr) {
-			if _, err := p.waitTracker(ctx, func(t codexTurnTracker) bool { return t.completed }); err != nil {
-				if interruptErr != nil {
-					return fmt.Errorf("interrupt Codex turn: %w", interruptErr)
-				}
-				return fmt.Errorf("interrupted turn did not settle: %w", err)
+		if err := p.waitInterruptedTurn(ctx, thread, interruptErr); err != nil {
+			if interruptErr != nil {
+				return fmt.Errorf("interrupt Codex turn: %w", interruptErr)
 			}
+			return fmt.Errorf("interrupted turn did not settle: %w", err)
 		}
 	}
 	commands := p.turnCommands(turn)
@@ -162,12 +160,41 @@ func (p *codexProcess) cleanupTurn() error {
 	}
 }
 
-func (p *codexProcess) threadIdleAfterInterrupt(ctx context.Context, threadID string, interruptErr error) bool {
-	var rpcErr *codexRPCError
-	if !errors.As(interruptErr, &rpcErr) || rpcErr.Code != -32600 {
-		return false
+func (p *codexProcess) waitInterruptedTurn(ctx context.Context, threadID string, interruptErr error) error {
+	if p.trackerSnapshot().completed {
+		return nil
 	}
-	result, _, err := p.transport.call(ctx, "thread/read", map[string]any{"threadId": threadID}, 0, nil)
+	var probeDone chan struct{}
+	var idle bool
+	var rpcErr *codexRPCError
+	if errors.As(interruptErr, &rpcErr) && rpcErr.Code == -32600 {
+		readCtx, cancel := context.WithCancel(ctx)
+		probeDone = make(chan struct{})
+		go func() {
+			idle = p.readIdleThread(readCtx, threadID)
+			close(probeDone)
+		}()
+		defer func() {
+			cancel()
+			<-probeDone
+		}()
+	}
+	_, err := p.waitTracker(ctx, func(t codexTurnTracker) bool {
+		if t.completed {
+			return true
+		}
+		select {
+		case <-probeDone:
+			return idle
+		default:
+			return false
+		}
+	})
+	return err
+}
+
+func (p *codexProcess) readIdleThread(ctx context.Context, threadID string) bool {
+	result, _, err := p.transport.call(ctx, "thread/read", map[string]any{"threadId": threadID}, 0, &codexCallHooks{bestEffort: true})
 	if err != nil {
 		return false
 	}
